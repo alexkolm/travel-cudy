@@ -1,0 +1,23 @@
+#!/bin/sh
+
+[ "$INTERFACE" = "wg0" ] || exit 0
+[ "$ACTION" = "ifup" ] || exit 0
+
+logger -t wg-routing "wg0 ifup — applying static rules"
+
+ip route replace default dev wg0 table wg
+
+ip rule show | grep -q "priority 500" || \
+    ip rule add to 127.0.0.0/8 lookup main priority 500
+ip rule show | grep -q "priority 600" || \
+    ip rule add from 192.168.99.0/24 to 192.168.99.0/24 lookup main priority 600
+ip rule show | grep -q "priority 601" || \
+    ip rule add from 192.168.99.0/24 to 10.0.0.0/8 lookup main priority 601
+ip rule show | grep -q "priority 602" || \
+    ip rule add from 192.168.99.0/24 to 172.16.0.0/12 lookup main priority 602
+ip rule show | grep -q "priority 603" || \
+    ip rule add from 192.168.99.0/24 to 192.168.0.0/16 lookup main priority 603
+ip rule show | grep -q "priority 650" || \
+    ip rule add from 192.168.99.0/24 to 10.66.0.0/24 lookup main priority 650
+
+logger -t wg-routing "Static rules applied OK"

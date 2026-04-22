@@ -1,0 +1,16 @@
+#!/bin/sh
+
+[ "$BUTTON" = "BTN_0" ] || exit 0
+
+case "$ACTION" in
+    released)
+        # Slider LEFT = tunnel ON
+        # Run in background so hotplug is not blocked
+        /usr/bin/tunnel-on &
+        ;;
+    pressed)
+        # Slider RIGHT = direct mode
+        # tunnel-off is fast, can run synchronously
+        /usr/bin/tunnel-off
+        ;;
+esac

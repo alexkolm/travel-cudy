@@ -1,0 +1,41 @@
+#!/bin/sh
+
+BINARY="/usr/bin/vk-turn-client"
+PEER="<REDACTED>"
+LISTEN="127.0.0.1:51820"
+VK_LINK="<REDACTED>"
+
+PROBE_IPS="93.186.225.208 87.240.190.67 95.142.192.246"
+MAX_WAIT=60
+
+if [ ! -x "$BINARY" ]; then
+    logger -t vk-turn "ERROR: client not found"
+    exit 1
+fi
+
+# анти-дубль
+if pgrep -f "$BINARY" | grep -v $$ > /dev/null 2>&1; then
+    logger -t vk-turn "Already running, abort"
+    exit 0
+fi
+
+# jitter
+sleep $(( (RANDOM % 3) + 2 ))
+
+logger -t vk-turn "Probing VK reachability..."
+
+elapsed=0
+while [ $elapsed -lt $MAX_WAIT ]; do
+    for ip in $PROBE_IPS; do
+        ping -c1 -W2 "$ip" >/dev/null 2>&1 && break 2
+    done
+    sleep 5
+    elapsed=$((elapsed + 5))
+done
+
+logger -t vk-turn "Starting client"
+
+exec "$BINARY" \
+    -peer "$PEER" \
+    -listen "$LISTEN" \
+    -vk-link "$VK_LINK"

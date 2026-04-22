@@ -1,0 +1,65 @@
+
+config interface 'loopback'
+	option device 'lo'
+	option proto 'static'
+	list ipaddr '127.0.0.1/8'
+
+config globals 'globals'
+	option dhcp_default_duid '000473236082f81b4c69ab21155704c0bfb7'
+	option ula_prefix 'fd8a:3ed5:d752::/48'
+
+config device
+	option name 'br-lan'
+	option type 'bridge'
+	list ports 'eth1'
+
+config interface 'lan'
+	option device 'br-lan'
+	option proto 'static'
+	option ipaddr '192.168.99.1'
+	option ip6assign '60'
+	option netmask '255.255.255.0'
+
+config interface 'wan'
+	option device 'eth0'
+	option proto 'dhcp'
+	option defaultroute '1'
+	option metric '10'
+
+config interface 'wan6'
+	option device 'eth0'
+	option proto 'dhcpv6'
+
+config interface 'wan24'
+	option proto 'dhcp'
+	option device 'phy0-sta0'
+	option defaultroute '1'
+	option metric '20'
+
+config interface 'wan5'
+	option proto 'dhcp'
+	option device 'phy1-sta0'
+	option defaultroute '1'
+	option metric '30'
+
+config interface
+	option name 'tailscale'
+	option proto 'none'
+	option device 'tailscale0'
+
+config interface 'wg0'
+	option proto 'wireguard'
+	option private_key '<REDACTED>'
+	list addresses '10.66.0.2/24'
+	option mtu '1420'
+	option peerdns '0'
+
+config wireguard_wg0
+	option public_key 'QbTqp2Mz/SmHqebfbrCCgtH2ZSa+VbI/ev95fTgFiGc='
+	list allowed_ips '10.66.0.0/24'
+	list allowed_ips '0.0.0.0/1'
+	list allowed_ips '128.0.0.0/1'
+	option endpoint_host '<REDACTED>'
+	option endpoint_port '<REDACTED>'
+	option persistent_keepalive '25'
+

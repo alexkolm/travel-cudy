@@ -1,0 +1,51 @@
+#!/bin/sh
+
+WHITE="/sys/class/leds/white:status/brightness"
+RED="/sys/class/leds/red:power/brightness"
+MONITOR_PIDFILE="/var/run/tunnel-monitor.pid"
+SELF_PIDFILE="/var/run/tunnel-on.pid"
+
+logger -t tunnel-switch "Activating direct mode"
+
+# Interrupt tunnel-on if it is waiting
+if [ -f "$SELF_PIDFILE" ]; then
+    PID=$(cat "$SELF_PIDFILE")
+    if kill -0 "$PID" 2>/dev/null; then
+        logger -t tunnel-switch "Interrupting tunnel-on (pid=$PID)"
+        kill "$PID" 2>/dev/null
+        sleep 1
+    fi
+    rm -f "$SELF_PIDFILE"
+fi
+
+# Stop monitor
+if [ -f "$MONITOR_PIDFILE" ]; then
+    PID=$(cat "$MONITOR_PIDFILE")
+    if kill -0 "$PID" 2>/dev/null; then
+        kill "$PID" 2>/dev/null
+    fi
+    rm -f "$MONITOR_PIDFILE"
+fi
+
+# Remove both managed rules together
+ip rule del priority 700 2>/dev/null
+ip rule del priority 750 2>/dev/null
+
+# Flush route cache so clients get updated routing immediately
+ip route flush cache
+
+# Stop tunnel
+/etc/init.d/vk-turn stop 2>/dev/null
+ifdown wg0 2>/dev/null
+
+# DNS: restore upstream from DHCP
+uci set dhcp.@dnsmasq[0].noresolv='0'
+uci del dhcp.@dnsmasq[0].server 2>/dev/null
+uci commit dhcp
+/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/dnsmasq restart
+
+# White OFF, red ON - direct mode
+echo 0 > "$WHITE"
+echo 1 > "$RED"
+
+logger -t tunnel-switch "Direct mode ON"
