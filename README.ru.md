@@ -21,6 +21,7 @@ vk-turn-wrapper
 
 init/
 vk-turn
+tunnel-switch-boot
 
 hotplug/
 button/
@@ -53,6 +54,7 @@ mwan3
 - hotplug:
   - кнопка → переключает режим
   - iface → восстанавливает routing при поднятии wg0
+  - положение переключателя сохраняется, и при старте запускается соответствующий режим (`left` = tunnel, `right` = direct)
 
 ## Важно
 

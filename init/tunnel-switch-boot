@@ -1,0 +1,26 @@
+#!/bin/sh /etc/rc.common
+
+START=98
+STOP=10
+
+STATE_FILE="/etc/tunnel-switch.position"
+
+start() {
+    state="$(cat "$STATE_FILE" 2>/dev/null)"
+
+    case "$state" in
+        left)
+            logger -t tunnel-switch "Boot sync: switch LEFT, enabling tunnel mode"
+            /usr/bin/tunnel-on &
+            ;;
+        right)
+            logger -t tunnel-switch "Boot sync: switch RIGHT, enabling direct mode"
+            /usr/bin/tunnel-off
+            ;;
+        *)
+            logger -t tunnel-switch "Boot sync: unknown switch state, fallback to direct mode"
+            /usr/bin/tunnel-off
+            ;;
+    esac
+}
+

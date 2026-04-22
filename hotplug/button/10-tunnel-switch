@@ -2,14 +2,18 @@
 
 [ "$BUTTON" = "BTN_0" ] || exit 0
 
+STATE_FILE="/etc/tunnel-switch.position"
+
 case "$ACTION" in
     released)
         # Slider LEFT = tunnel ON
+        echo "left" > "$STATE_FILE"
         # Run in background so hotplug is not blocked
         /usr/bin/tunnel-on &
         ;;
     pressed)
         # Slider RIGHT = direct mode
+        echo "right" > "$STATE_FILE"
         # tunnel-off is fast, can run synchronously
         /usr/bin/tunnel-off
         ;;
