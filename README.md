@@ -1,11 +1,19 @@
 # travel-cudy
 
-OpenWrt router configuration for tunnel switching:
-- vk-turn wrapper service
-- tunnel on/off/monitor scripts
-- hotplug automation
-- WireGuard routing setup
+OpenWrt router automation for dynamic tunnel switching via WireGuard and VK TURN.
+
+## Documentation
+
+- 🇷🇺 Russian documentation: [README.ru.md](README.ru.md)
+
+## Features
+
+- Tunnel / direct mode switching
+- WireGuard integration
+- Hotplug automation
+- LED status indication
 
 ## Notes
+
 - Secrets are redacted
-- Binary vk-turn-client is not included
+- vk-turn-client binary is not included
