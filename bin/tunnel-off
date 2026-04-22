@@ -38,4 +38,16 @@ uci del dhcp.@dnsmasq[0].server 2>/dev/null
 uci commit dhcp
 /etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/dnsmasq restart
 
+# Trigger DHCP renew on uplinks so /tmp/resolv.conf.d/resolv.conf.auto
+# is refreshed quickly after switching back from tunnel mode
+for IFACE in wan wan24 wan5; do
+    ubus call "network.interface.${IFACE}" renew >/dev/null 2>&1
+done
+
+# mwan3 keeps sticky HTTPS sessions; restart helps clear stale path decisions
+/etc/init.d/mwan3 restart >/dev/null 2>&1
+
+# Flush conntrack to drop stale sessions created before routing change
+command -v conntrack >/dev/null 2>&1 && conntrack -F >/dev/null 2>&1
+
 logger -t tunnel-switch "Direct mode ON"
