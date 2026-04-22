@@ -2,10 +2,13 @@
 
 WHITE="/sys/class/leds/white:status/brightness"
 RED="/sys/class/leds/red:power/brightness"
-MONITOR_PIDFILE="/var/run/tunnel-monitor.pid"
 SELF_PIDFILE="/var/run/tunnel-on.pid"
 
 logger -t tunnel-switch "Activating direct mode"
+
+# Tunnel OFF indication: white OFF, red ON
+echo 0 > "$WHITE"
+echo 1 > "$RED"
 
 # Interrupt tunnel-on if it is waiting
 if [ -f "$SELF_PIDFILE" ]; then
@@ -16,15 +19,6 @@ if [ -f "$SELF_PIDFILE" ]; then
         sleep 1
     fi
     rm -f "$SELF_PIDFILE"
-fi
-
-# Stop monitor
-if [ -f "$MONITOR_PIDFILE" ]; then
-    PID=$(cat "$MONITOR_PIDFILE")
-    if kill -0 "$PID" 2>/dev/null; then
-        kill "$PID" 2>/dev/null
-    fi
-    rm -f "$MONITOR_PIDFILE"
 fi
 
 # Remove both managed rules together
@@ -43,9 +37,5 @@ uci set dhcp.@dnsmasq[0].noresolv='0'
 uci del dhcp.@dnsmasq[0].server 2>/dev/null
 uci commit dhcp
 /etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/dnsmasq restart
-
-# White OFF, red ON - direct mode
-echo 0 > "$WHITE"
-echo 1 > "$RED"
 
 logger -t tunnel-switch "Direct mode ON"

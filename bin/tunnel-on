@@ -2,7 +2,6 @@
 
 WHITE="/sys/class/leds/white:status/brightness"
 RED="/sys/class/leds/red:power/brightness"
-MONITOR_PIDFILE="/var/run/tunnel-monitor.pid"
 SELF_PIDFILE="/var/run/tunnel-on.pid"
 VPS_WG_IP="10.66.0.1"
 MAX_WAIT=300
@@ -12,18 +11,9 @@ echo $$ > "$SELF_PIDFILE"
 
 logger -t tunnel-switch "Activating tunnel mode (pid=$$)"
 
-# White ON, Red ON - tunnel starting (pink)
+# Tunnel ON indication: white ON, red OFF
 echo 1 > "$WHITE"
-echo 1 > "$RED"
-
-# Stop existing monitor
-if [ -f "$MONITOR_PIDFILE" ]; then
-    PID=$(cat "$MONITOR_PIDFILE")
-    if kill -0 "$PID" 2>/dev/null; then
-        kill "$PID" 2>/dev/null
-    fi
-    rm -f "$MONITOR_PIDFILE"
-fi
+echo 0 > "$RED"
 
 # Start tunnel
 /etc/init.d/vk-turn start 2>/dev/null
@@ -62,7 +52,6 @@ while [ $elapsed -lt $MAX_WAIT ]; do
     if ping -c1 -W2 -I wg0 "$VPS_WG_IP" > /dev/null 2>&1; then
         logger -t tunnel-switch "Tunnel up after ${elapsed}s"
         ip route flush cache
-        echo 0 > "$RED"
         rm -f "$SELF_PIDFILE"
         break
     fi
@@ -79,10 +68,7 @@ fi
 if [ $elapsed -ge $MAX_WAIT ]; then
     logger -t tunnel-switch "WARNING: tunnel timeout after ${MAX_WAIT}s"
     rm -f "$SELF_PIDFILE"
-    # Red stays ON as problem indicator
     exit 0
 fi
 
-# Start background monitor
-/usr/bin/tunnel-monitor &
 logger -t tunnel-switch "Tunnel mode ON"
