@@ -8,42 +8,47 @@ LOG_TAG="wifi-fallback"
 CHECK_INTERVAL="${CHECK_INTERVAL:-10}"
 STA_TIMEOUT="${STA_TIMEOUT:-45}"
 MIN_STATE_SECS="${MIN_STATE_SECS:-60}"
-UPLINK_MIN_RSSI="${UPLINK_MIN_RSSI:--70}"
-KNOWN_SSIDS="${KNOWN_SSIDS:-uplink TV5}"
-
-# AP-priority mode (per band): keep AP stable when STA uplink for this band is unavailable,
-# periodically probe STA uplink and return to sta+ap on success.
-AP_PRIORITY_24="${AP_PRIORITY_24:-1}"
-PROBE_INTERVAL_24="${PROBE_INTERVAL_24:-180}"
-PROBE_WINDOW_24="${PROBE_WINDOW_24:-12}"
-
-AP_PRIORITY_5="${AP_PRIORITY_5:-1}"
-PROBE_INTERVAL_5="${PROBE_INTERVAL_5:-180}"
-PROBE_WINDOW_5="${PROBE_WINDOW_5:-12}"
 
 mkdir -p "$STATE_DIR"
+
 log() { logger -t "$LOG_TAG" "$*"; }
 
-with_lock() { exec 9>"$LOCK_FILE"; flock -n 9 || exit 0; }
-now_ts() { date +%s; }
+with_lock() {
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || exit 0
+}
+
+now() { date +%s; }
 
 sf() { echo "$STATE_DIR/$1.state"; }
+tf() { echo "$STATE_DIR/$1.ts"; }
 ff() { echo "$STATE_DIR/$1.fail"; }
-tf() { echo "$STATE_DIR/$1.last_change"; }
-pf() { echo "$STATE_DIR/$1.last_probe"; }
 
 getv() { [ -f "$1" ] && cat "$1" || echo "$2"; }
 setv() { echo "$2" > "$1"; }
 
 state() { getv "$(sf "$1")" "sta+ap"; }
-set_state() { setv "$(sf "$1")" "$2"; setv "$(tf "$1")" "$(now_ts)"; }
+set_state() { setv "$(sf "$1")" "$2"; setv "$(tf "$1")" "$(now)"; }
+
 failv() { getv "$(ff "$1")" 0; }
 set_fail() { setv "$(ff "$1")" "$2"; }
-secs_in_state() { echo $(( $(now_ts) - $(getv "$(tf "$1")" "$(now_ts)") )); }
-secs_since_probe() { echo $(( $(now_ts) - $(getv "$(pf "$1")" 0) )); }
-mark_probe() { setv "$(pf "$1")" "$(now_ts)"; }
 
-wifi_reload() { wifi reload >/dev/null 2>&1 || true; }
+secs_in_state() {
+  echo $(( $(now) - $(getv "$(tf "$1")" "$(now)") ))
+}
+
+iface_exists() {
+  iw dev 2>/dev/null | grep -q "Interface $1"
+}
+
+is_link_up() {
+  iface_exists "$1" || return 1
+  iw dev "$1" link 2>/dev/null | grep -q "Connected to"
+}
+
+wan_up() {
+  ifstatus "$1" 2>/dev/null | grep -q '"up": true'
+}
 
 uci_set_bool() {
   local sec="$1" val="$2" cur
@@ -53,128 +58,113 @@ uci_set_bool() {
   return 0
 }
 
-apply_config_if_changed() {
+apply_changes() {
   if [ "${CFG_CHANGED:-0}" = "1" ]; then
     uci commit wireless
-    wifi_reload
     CFG_CHANGED=0
   fi
 }
 
-is_link_up() { iw dev "$1" link 2>/dev/null | grep -q "Connected to"; }
-wan_up() { ifstatus "$1" 2>/dev/null | grep -q '"up": true'; }
-
-ssid_ok() {
-  local sta_if="$1" ssid rssi rssi_int
-  iw dev "$sta_if" scan 2>/dev/null > "$STATE_DIR/${sta_if}.scan" || true
-  for ssid in $KNOWN_SSIDS; do
-    rssi="$(grep -A5 "SSID: ${ssid}$" "$STATE_DIR/${sta_if}.scan" | grep -m1 "signal:" | sed -E 's/.*signal: *(-?[0-9]+(\.[0-9]+)?) .*/\1/' || true)"
-    [ -n "$rssi" ] || continue
-    rssi_int="${rssi%%.*}"
-    if [ "$rssi_int" -ge "$UPLINK_MIN_RSSI" ]; then
-      log "$sta_if sees '$ssid' at $rssi dBm"
-      return 0
-    fi
-  done
-  return 1
+ensure_ap_enabled() {
+  CFG_CHANGED=0
+  uci_set_bool "ap24" 0 && CFG_CHANGED=1 || true
+  uci_set_bool "ap5"  0 && CFG_CHANGED=1 || true
+  apply_changes
 }
 
-band_tick_ap_priority() {
-  local b="$1" sta_sec="$2" ap_sec="$3" sta_if="$4" netif="$5" probe_interval="$6" probe_window="$7"
-  local st fv el since_probe
+enable_sta() {
+  local sta="$1" net="$2"
 
-  st="$(state "$b")"; el="$(secs_in_state "$b")"
+  CFG_CHANGED=0
+  uci_set_bool "$sta" 0 && CFG_CHANGED=1 || true
+  apply_changes
 
-  if is_link_up "$sta_if"; then
-    CFG_CHANGED=0
-    uci_set_bool "$ap_sec" 0 && CFG_CHANGED=1 || true
-    uci_set_bool "$sta_sec" 0 && CFG_CHANGED=1 || true
-    apply_config_if_changed
-    if ! wan_up "$netif"; then ifup "$netif" 2>/dev/null || true; fi
-    set_fail "$b" 0
-    [ "$st" = "sta+ap" ] || { set_state "$b" "sta+ap"; log "$b -> sta+ap"; }
-    return
+  if ! wan_up "$net"; then
+    ifup "$net" 2>/dev/null || true
   fi
-
-  # Not linked: keep AP stable by disabling STA on this band.
-  CFG_CHANGED=0
-  uci_set_bool "$ap_sec" 0 && CFG_CHANGED=1 || true
-  uci_set_bool "$sta_sec" 1 && CFG_CHANGED=1 || true
-  apply_config_if_changed
-  ifdown "$netif" 2>/dev/null || true
-
-  fv="$(failv "$b")"; fv=$((fv + CHECK_INTERVAL)); set_fail "$b" "$fv"
-  [ "$st" = "ap-only" ] || { set_state "$b" "ap-only"; log "$b -> ap-only (STA disabled for AP stability)"; }
-
-  since_probe="$(secs_since_probe "$b")"
-  [ "$since_probe" -ge "$probe_interval" ] || return
-
-  mark_probe "$b"
-  log "$b probe: enabling STA for ${probe_window}s"
-  CFG_CHANGED=0
-  uci_set_bool "$sta_sec" 0 && CFG_CHANGED=1 || true
-  apply_config_if_changed
-  sleep "$probe_window"
-
-  if is_link_up "$sta_if" && ssid_ok "$sta_if"; then
-    ifup "$netif" 2>/dev/null || true
-    set_state "$b" "sta+ap"
-    set_fail "$b" 0
-    log "$b probe success -> sta+ap"
-    return
-  fi
-
-  CFG_CHANGED=0
-  uci_set_bool "$sta_sec" 1 && CFG_CHANGED=1 || true
-  apply_config_if_changed
-  ifdown "$netif" 2>/dev/null || true
-  set_state "$b" "ap-only"
-  log "$b probe failed -> keep ap-only"
 }
 
-band_tick_l3_fallback() {
-  local b="$1" sta_sec="$2" ap_sec="$3" sta_if="$4" netif="$5"
+disable_sta() {
+  local sta="$1" net="$2"
+
+  CFG_CHANGED=0
+  uci_set_bool "$sta" 1 && CFG_CHANGED=1 || true
+  apply_changes
+
+  ifdown "$net" 2>/dev/null || true
+}
+
+band_tick() {
+  local b="$1" sta="$2" ap="$3" sta_if="$4" net="$5"
   local st fv el
 
-  CFG_CHANGED=0
-  uci_set_bool "$ap_sec" 0 && CFG_CHANGED=1 || true
-  uci_set_bool "$sta_sec" 0 && CFG_CHANGED=1 || true
-  apply_config_if_changed
+  st="$(state "$b")"
+  el="$(secs_in_state "$b")"
 
-  st="$(state "$b")"; el="$(secs_in_state "$b")"
   if is_link_up "$sta_if"; then
-    if ! wan_up "$netif"; then ifup "$netif" 2>/dev/null || true; fi
+    enable_sta "$sta" "$net"
     set_fail "$b" 0
-    [ "$st" = "sta+ap" ] || set_state "$b" "sta+ap"
+
+    [ "$st" = "sta+ap" ] || {
+      set_state "$b" "sta+ap"
+      log "$b -> sta+ap"
+    }
     return
   fi
 
-  fv="$(failv "$b")"; fv=$((fv + CHECK_INTERVAL)); set_fail "$b" "$fv"
-  if [ "$st" = "sta+ap" ] && [ "$fv" -ge "$STA_TIMEOUT" ] && [ "$el" -ge "$MIN_STATE_SECS" ]; then
-    ifdown "$netif" 2>/dev/null || true
-    set_state "$b" "ap-only"
-    log "$b -> ap-only"
+  # Give STA time after boot
+  if [ "$el" -lt "$STA_TIMEOUT" ]; then
+    return
+  fi
+
+  fv="$(failv "$b")"
+  fv=$((fv + CHECK_INTERVAL))
+  set_fail "$b" "$fv"
+
+  if [ "$fv" -ge "$STA_TIMEOUT" ] && [ "$el" -ge "$MIN_STATE_SECS" ]; then
+    disable_sta "$sta" "$net"
+
+    [ "$st" = "ap-only" ] || {
+      set_state "$b" "ap-only"
+      log "$b -> ap-only"
+    }
   fi
 }
 
 main() {
   with_lock
 
-  if [ "$AP_PRIORITY_24" = "1" ]; then
-    band_tick_ap_priority "2g" "wsta24" "ap24" "phy0-sta0" "wan24" "$PROBE_INTERVAL_24" "$PROBE_WINDOW_24"
-  else
-    band_tick_l3_fallback "2g" "wsta24" "ap24" "phy0-sta0" "wan24"
+  # Always keep AP enabled
+  ensure_ap_enabled
+
+  # Detect uplinks
+  UPLINK_24=0
+  UPLINK_5=0
+
+  is_link_up "phy0-sta0" && UPLINK_24=1
+  is_link_up "phy1-sta0" && UPLINK_5=1
+
+  # If uplink on 2.4 → disable 5 GHz STA (critical fix)
+  if [ "$UPLINK_24" = "1" ] && [ "$UPLINK_5" = "0" ]; then
+    disable_sta "wsta5" "wan5"
   fi
 
-  if [ "$AP_PRIORITY_5" = "1" ]; then
-    band_tick_ap_priority "5g" "wsta5" "ap5" "phy1-sta0" "wan5" "$PROBE_INTERVAL_5" "$PROBE_WINDOW_5"
-  else
-    band_tick_l3_fallback "5g" "wsta5" "ap5" "phy1-sta0" "wan5"
+  # If uplink on 5 GHz → disable 2.4 STA
+  if [ "$UPLINK_5" = "1" ] && [ "$UPLINK_24" = "0" ]; then
+    disable_sta "wsta24" "wan24"
   fi
+
+  # If any uplink is active → do nothing else
+  if [ "$UPLINK_24" = "1" ] || [ "$UPLINK_5" = "1" ]; then
+    return
+  fi
+
+  # No uplink → fallback logic
+  band_tick "2g" "wsta24" "ap24" "phy0-sta0" "wan24"
+  band_tick "5g" "wsta5"  "ap5"  "phy1-sta0" "wan5"
 }
 
 while true; do
   main
   sleep "$CHECK_INTERVAL"
 done
-
