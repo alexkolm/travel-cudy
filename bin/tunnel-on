@@ -1,74 +1,130 @@
 #!/bin/sh
-
+# /usr/bin/tunnel-on
 WHITE="/sys/class/leds/white:status/brightness"
 RED="/sys/class/leds/red:power/brightness"
-SELF_PIDFILE="/var/run/tunnel-on.pid"
-VPS_WG_IP="10.66.0.1"
-MAX_WAIT=300
+TURNABLE_BIN="/usr/bin/turnable-client"
+TURNABLE_CFG="/etc/turnable/client.json"
+TURNABLE_PIDFILE="/var/run/turnable-client.pid"
+TURNABLE_LISTEN="127.0.0.1:51820"
+# 51820 = 0xCA6C, 127.0.0.1 little-endian hex = 0100007F
+TURNABLE_PORT_HEX="0100007F:CA6C"
 
-# Register own PID so tunnel-off can interrupt us
-echo $$ > "$SELF_PIDFILE"
-
-logger -t tunnel-switch "Activating tunnel mode (pid=$$)"
-
-# Tunnel ON indication: white ON, red OFF
+logger -t tunnel-switch "Activating tunnel mode"
 echo 1 > "$WHITE"
 echo 0 > "$RED"
 
-# Start tunnel
-/etc/init.d/vk-turn start 2>/dev/null
-ifup wg0 2>/dev/null
-sleep 2
+# Rollback on error
+cleanup() {
+    logger -t tunnel-switch "ERROR: rolling back"
+    iptables -t mangle -D PREROUTING -i br-lan -j RETURN 2>/dev/null
+    ip rule del priority 700 2>/dev/null
+    ip rule del priority 750 2>/dev/null
+    if [ -f "$TURNABLE_PIDFILE" ]; then
+        kill "$(cat $TURNABLE_PIDFILE)" 2>/dev/null
+        rm -f "$TURNABLE_PIDFILE"
+    fi
+    rm -f /var/run/tunnel-active
+}
 
-# Restore route in wg table
-ip route replace default dev wg0 table wg 2>/dev/null
+# Guard against double invocation
+if [ -f /var/run/tunnel-active ]; then
+    logger -t tunnel-switch "Already active, skipping"
+    exit 0
+fi
 
-# Add managed routing rules (700 + 750 always together)
+# Check binary
+if [ ! -x "$TURNABLE_BIN" ]; then
+    logger -t tunnel-switch "ERROR: $TURNABLE_BIN not found or not executable"
+    exit 1
+fi
+
+# 1. Block mwan3 for LAN traffic
+iptables -t mangle -C PREROUTING -i br-lan -j RETURN 2>/dev/null || \
+    iptables -t mangle -I PREROUTING 1 -i br-lan -j RETURN
+
+# 2. Flush conntrack after blocking (new packets won't get mwan3 marks)
+conntrack -D -s 192.168.99.0/24 2>/dev/null || true
+conntrack -D -d 192.168.99.0/24 2>/dev/null || true
+
+# 3. Stop existing turnable process if any
+if [ -f "$TURNABLE_PIDFILE" ]; then
+    OLD_PID=$(cat "$TURNABLE_PIDFILE")
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+        logger -t tunnel-switch "Stopping old turnable-client (pid=$OLD_PID)"
+        kill "$OLD_PID" 2>/dev/null
+        elapsed=0
+        while [ $elapsed -lt 5 ] && kill -0 "$OLD_PID" 2>/dev/null; do
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        kill -0 "$OLD_PID" 2>/dev/null && kill -9 "$OLD_PID" 2>/dev/null
+    fi
+    rm -f "$TURNABLE_PIDFILE"
+else
+    # No pidfile - fallback kill by name
+    pkill -f "^$TURNABLE_BIN client" 2>/dev/null
+    sleep 1
+fi
+
+# 4. Start turnable-client
+# Log goes to /tmp/turnable.log (tmpfs, always available)
+logger -t tunnel-switch "Starting turnable-client"
+"$TURNABLE_BIN" client \
+    -c "$TURNABLE_CFG" \
+    -l "$TURNABLE_LISTEN" \
+    > /tmp/turnable.log 2>&1 &
+TURNABLE_PID=$!
+echo $TURNABLE_PID > "$TURNABLE_PIDFILE"
+logger -t tunnel-switch "turnable-client started (pid=$TURNABLE_PID)"
+
+# 5. Check process did not die immediately
+sleep 1
+if ! kill -0 "$TURNABLE_PID" 2>/dev/null; then
+    logger -t tunnel-switch "ERROR: turnable-client died immediately"
+    tail -5 /tmp/turnable.log | logger -t turnable-client
+    cleanup
+    exit 1
+fi
+logger -t tunnel-switch "turnable-client alive"
+
+# 6. Wait for UDP listener via /proc/net/udp (no netstat/ss needed)
+elapsed=0
+while [ $elapsed -lt 10 ]; do
+    grep -q "$TURNABLE_PORT_HEX" /proc/net/udp 2>/dev/null && break
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+if grep -q "$TURNABLE_PORT_HEX" /proc/net/udp 2>/dev/null; then
+    logger -t tunnel-switch "Turnable listening on :51820 after ${elapsed}s"
+else
+    logger -t tunnel-switch "WARNING: :51820 not detected after 10s, proceeding"
+fi
+
+# 7. Bring up WireGuard (listener is ready, relay establishes in parallel)
+ifup wg0 || {
+    logger -t tunnel-switch "ERROR: ifup wg0 failed"
+    cleanup
+    exit 1
+}
+
+# 8. Wait for WireGuard handshake
+sleep 5
+if wg show wg0 2>/dev/null | grep -q "latest handshake"; then
+    logger -t tunnel-switch "WG handshake established"
+else
+    logger -t tunnel-switch "WARNING: no WG handshake yet (may come later)"
+fi
+
+# 9. Set up policy routing
+ip route replace default dev wg0 table wg
 ip rule show | grep -q "priority 700" || \
     ip rule add from 192.168.99.0/24 lookup wg priority 700
 ip rule show | grep -q "priority 750" || \
     ip rule add from 192.168.99.0/24 unreachable priority 750
 
-# DNS: switch to public resolvers
-if ! uci get dhcp.@dnsmasq[0].server 2>/dev/null | grep -q "1.1.1.1"; then
-    uci set dhcp.@dnsmasq[0].noresolv='1'
-    uci del dhcp.@dnsmasq[0].server 2>/dev/null
-    uci add_list dhcp.@dnsmasq[0].server='1.1.1.1'
-    uci add_list dhcp.@dnsmasq[0].server='8.8.8.8'
-    uci commit dhcp
-    /etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/dnsmasq restart
-fi
+# 10. Flush route cache
+ip route flush cache
 
-# Wait for tunnel handshake
-logger -t tunnel-switch "Waiting for tunnel (max ${MAX_WAIT}s)..."
-elapsed=0
-while [ $elapsed -lt $MAX_WAIT ]; do
-    # Check if tunnel-off interrupted us
-    if [ ! -f "$SELF_PIDFILE" ]; then
-        logger -t tunnel-switch "Interrupted by tunnel-off - exiting"
-        exit 0
-    fi
-
-    if ping -c1 -W2 -I wg0 "$VPS_WG_IP" > /dev/null 2>&1; then
-        logger -t tunnel-switch "Tunnel up after ${elapsed}s"
-        ip route flush cache
-        rm -f "$SELF_PIDFILE"
-        break
-    fi
-    sleep 2
-    elapsed=$((elapsed + 2))
-done
-
-# Check if we were interrupted during sleep
-if [ ! -f "$SELF_PIDFILE" ]; then
-    logger -t tunnel-switch "Interrupted by tunnel-off during wait - exiting"
-    exit 0
-fi
-
-if [ $elapsed -ge $MAX_WAIT ]; then
-    logger -t tunnel-switch "WARNING: tunnel timeout after ${MAX_WAIT}s"
-    rm -f "$SELF_PIDFILE"
-    exit 0
-fi
-
+# 11. Write state marker
+touch /var/run/tunnel-active
 logger -t tunnel-switch "Tunnel mode ON"

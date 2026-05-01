@@ -3,3 +3,4 @@
 *.bak
 secrets/
 secure-backup/
+turnable/client.json

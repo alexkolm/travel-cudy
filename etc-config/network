@@ -49,9 +49,9 @@ config interface
 
 config interface 'wg0'
 	option proto 'wireguard'
-	option private_key '<REDACTED>'
-	list addresses '10.66.0.2/24'
-	option mtu '1420'
+	option private_key 'sPPv4/2UcUjCLdw+VT/KzmSzg2aLsujI/rOQpxubcm0='
+	option addresses '10.66.0.10/24'
+	option mtu '1280'
 	option peerdns '0'
 
 config wireguard_wg0
@@ -59,7 +59,7 @@ config wireguard_wg0
 	list allowed_ips '10.66.0.0/24'
 	list allowed_ips '0.0.0.0/1'
 	list allowed_ips '128.0.0.0/1'
-	option endpoint_host '<REDACTED>'
-	option endpoint_port '<REDACTED>'
+	option endpoint_host '127.0.0.1'
+	option endpoint_port '51820'
 	option persistent_keepalive '25'
 

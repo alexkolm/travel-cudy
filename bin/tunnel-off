@@ -1,53 +1,60 @@
 #!/bin/sh
-
+# /usr/bin/tunnel-off
 WHITE="/sys/class/leds/white:status/brightness"
 RED="/sys/class/leds/red:power/brightness"
-SELF_PIDFILE="/var/run/tunnel-on.pid"
+TURNABLE_BIN="/usr/bin/turnable-client"
+TURNABLE_PIDFILE="/var/run/turnable-client.pid"
 
 logger -t tunnel-switch "Activating direct mode"
-
-# Tunnel OFF indication: white OFF, red ON
 echo 0 > "$WHITE"
 echo 1 > "$RED"
 
-# Interrupt tunnel-on if it is waiting
-if [ -f "$SELF_PIDFILE" ]; then
-    PID=$(cat "$SELF_PIDFILE")
-    if kill -0 "$PID" 2>/dev/null; then
-        logger -t tunnel-switch "Interrupting tunnel-on (pid=$PID)"
-        kill "$PID" 2>/dev/null
-        sleep 1
-    fi
-    rm -f "$SELF_PIDFILE"
-fi
+# 1. Temporary blackhole to prevent traffic leak during switchover
+ip rule add from 192.168.99.0/24 unreachable priority 699 2>/dev/null
 
-# Remove both managed rules together
+# 2. Remove WireGuard routing rules
 ip rule del priority 700 2>/dev/null
 ip rule del priority 750 2>/dev/null
 
-# Flush route cache so clients get updated routing immediately
-ip route flush cache
-
-# Stop tunnel
-/etc/init.d/vk-turn stop 2>/dev/null
+# 3. Bring down WireGuard before stopping Turnable
 ifdown wg0 2>/dev/null
 
-# DNS: restore upstream from DHCP
-uci set dhcp.@dnsmasq[0].noresolv='0'
-uci del dhcp.@dnsmasq[0].server 2>/dev/null
-uci commit dhcp
-/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/dnsmasq restart
+# 4. Stop turnable-client
+if [ -f "$TURNABLE_PIDFILE" ]; then
+    PID=$(cat "$TURNABLE_PIDFILE")
+    if kill -0 "$PID" 2>/dev/null; then
+        logger -t tunnel-switch "Stopping turnable-client (pid=$PID)"
+        kill "$PID" 2>/dev/null
+        elapsed=0
+        while [ $elapsed -lt 5 ] && kill -0 "$PID" 2>/dev/null; do
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        kill -0 "$PID" 2>/dev/null && kill -9 "$PID" 2>/dev/null
+        logger -t tunnel-switch "turnable-client stopped"
+    else
+        logger -t tunnel-switch "turnable-client already dead"
+    fi
+    rm -f "$TURNABLE_PIDFILE"
+else
+    # No pidfile - fallback kill by name
+    pkill -f "^$TURNABLE_BIN client" 2>/dev/null
+    logger -t tunnel-switch "turnable-client stopped (by name)"
+fi
 
-# Trigger DHCP renew on uplinks so /tmp/resolv.conf.d/resolv.conf.auto
-# is refreshed quickly after switching back from tunnel mode
-for IFACE in wan wan24 wan5; do
-    ubus call "network.interface.${IFACE}" renew >/dev/null 2>&1
-done
+# 5. Restore mwan3 for LAN traffic
+iptables -t mangle -D PREROUTING -i br-lan -j RETURN 2>/dev/null || true
 
-# mwan3 keeps sticky HTTPS sessions; restart helps clear stale path decisions
-/etc/init.d/mwan3 restart >/dev/null 2>&1
+# 6. Flush LAN conntrack entries (mwan3 will re-mark on new connections)
+conntrack -D -s 192.168.99.0/24 2>/dev/null || true
+conntrack -D -d 192.168.99.0/24 2>/dev/null || true
 
-# Flush conntrack to drop stale sessions created before routing change
-command -v conntrack >/dev/null 2>&1 && conntrack -F >/dev/null 2>&1
+# 7. Remove blackhole (mwan3 is ready to handle traffic)
+ip rule del priority 699 2>/dev/null
 
+# 8. Flush route cache
+ip route flush cache
+
+# 9. Remove state marker
+rm -f /var/run/tunnel-active
 logger -t tunnel-switch "Direct mode ON"
