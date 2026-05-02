@@ -4,167 +4,189 @@ set -eu
 LOCK_FILE="/var/run/wifi-fallback.lock"
 STATE_DIR="/var/run/wifi-fallback"
 LOG_TAG="wifi-fallback"
-
 CHECK_INTERVAL="${CHECK_INTERVAL:-10}"
-STA_TIMEOUT="${STA_TIMEOUT:-45}"
-MIN_STATE_SECS="${MIN_STATE_SECS:-60}"
+PROBE_INTERVAL="${PROBE_INTERVAL:-60}"
+ASSOC_TIMEOUT="${ASSOC_TIMEOUT:-60}"
 
 mkdir -p "$STATE_DIR"
 
 log() { logger -t "$LOG_TAG" "$*"; }
 
 with_lock() {
-  exec 9>"$LOCK_FILE"
-  flock -n 9 || exit 0
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || exit 0
 }
 
 now() { date +%s; }
 
-sf() { echo "$STATE_DIR/$1.state"; }
-tf() { echo "$STATE_DIR/$1.ts"; }
-ff() { echo "$STATE_DIR/$1.fail"; }
-
-getv() { [ -f "$1" ] && cat "$1" || echo "$2"; }
-setv() { echo "$2" > "$1"; }
-
-state() { getv "$(sf "$1")" "sta+ap"; }
-set_state() { setv "$(sf "$1")" "$2"; setv "$(tf "$1")" "$(now)"; }
-
-failv() { getv "$(ff "$1")" 0; }
-set_fail() { setv "$(ff "$1")" "$2"; }
-
-secs_in_state() {
-  echo $(( $(now) - $(getv "$(tf "$1")" "$(now)") ))
-}
-
 iface_exists() {
-  iw dev 2>/dev/null | grep -q "Interface $1"
+    iw dev 2>/dev/null | grep -q "Interface $1"
 }
 
 is_link_up() {
-  iface_exists "$1" || return 1
-  iw dev "$1" link 2>/dev/null | grep -q "Connected to"
+    iface_exists "$1" || return 1
+    iw dev "$1" link 2>/dev/null | grep -q "Connected to"
 }
 
-wan_up() {
-  ifstatus "$1" 2>/dev/null | grep -q '"up": true'
+ap_is_up() {
+    iface_exists "$1" || return 1
+    iw dev "$1" info 2>/dev/null | grep -q "type AP"
 }
 
-uci_set_bool() {
-  local sec="$1" val="$2" cur
-  cur="$(uci -q get "wireless.${sec}.disabled" || echo 0)"
-  [ "$cur" = "$val" ] && return 1
-  uci set "wireless.${sec}.disabled=$val"
-  return 0
+# Passive scan for SSID via AP interface - does not disturb AP or clients
+ssid_visible() {
+    local ap_if="$1"
+    local ssid="$2"
+    iface_exists "$ap_if" || return 1
+    iw dev "$ap_if" scan 2>/dev/null | grep -q "SSID: ${ssid}"
 }
 
-apply_changes() {
-  if [ "${CFG_CHANGED:-0}" = "1" ]; then
-    uci commit wireless
-    CFG_CHANGED=0
-  fi
+# Restore AP if missing - reload only affected radio
+ensure_ap() {
+    local ap_if="$1"
+    local uci_ap="$2"
+    local radio="$3"
+    if ! ap_is_up "$ap_if"; then
+        log "AP $ap_if not up → restoring ($radio)"
+        uci set "wireless.${uci_ap}.disabled=0"
+        uci commit wireless
+        wifi reload "$radio" >/dev/null 2>&1 || wifi reload >/dev/null 2>&1 || true
+        sleep 3
+        if ap_is_up "$ap_if"; then
+            log "AP $ap_if restored OK"
+        else
+            log "WARNING: AP $ap_if still not up after restore"
+        fi
+    fi
 }
 
-ensure_ap_enabled() {
-  CFG_CHANGED=0
-  uci_set_bool "ap24" 0 && CFG_CHANGED=1 || true
-  uci_set_bool "ap5"  0 && CFG_CHANGED=1 || true
-  apply_changes
-}
-
+# Enable STA: clear disabled, reload radio, trigger DHCP
 enable_sta() {
-  local sta="$1" net="$2"
-
-  CFG_CHANGED=0
-  uci_set_bool "$sta" 0 && CFG_CHANGED=1 || true
-  apply_changes
-
-  if ! wan_up "$net"; then
+    local uci_sta="$1"
+    local radio="$2"
+    local net="$3"
+    log "Enabling STA: $uci_sta on $radio"
+    uci set "wireless.${uci_sta}.disabled=0"
+    uci commit wireless
+    wifi reload "$radio" >/dev/null 2>&1 || wifi reload >/dev/null 2>&1 || true
+    sleep 3
     ifup "$net" 2>/dev/null || true
-  fi
 }
 
+# Disable STA: set disabled, reload radio
+# AP stays up because its disabled flag is untouched
 disable_sta() {
-  local sta="$1" net="$2"
-
-  CFG_CHANGED=0
-  uci_set_bool "$sta" 1 && CFG_CHANGED=1 || true
-  apply_changes
-
-  ifdown "$net" 2>/dev/null || true
+    local uci_sta="$1"
+    local radio="$2"
+    local net="$3"
+    log "Disabling STA: $uci_sta on $radio"
+    ifdown "$net" 2>/dev/null || true
+    uci set "wireless.${uci_sta}.disabled=1"
+    uci commit wireless
+    wifi reload "$radio" >/dev/null 2>&1 || wifi reload >/dev/null 2>&1 || true
+    sleep 2
 }
 
-band_tick() {
-  local b="$1" sta="$2" ap="$3" sta_if="$4" net="$5"
-  local st fv el
+state_file() { echo "$STATE_DIR/$1.state"; }
+ts_file()    { echo "$STATE_DIR/$1.ts"; }
 
-  st="$(state "$b")"
-  el="$(secs_in_state "$b")"
+get_state() {
+    [ -f "$(state_file "$1")" ] && cat "$(state_file "$1")" || echo "init"
+}
 
-  if is_link_up "$sta_if"; then
-    enable_sta "$sta" "$net"
-    set_fail "$b" 0
+set_state() {
+    echo "$2" > "$(state_file "$1")"
+    now > "$(ts_file "$1")"
+    log "$1 state → $2"
+}
 
-    [ "$st" = "sta+ap" ] || {
-      set_state "$b" "sta+ap"
-      log "$b -> sta+ap"
-    }
-    return
-  fi
+get_ts() {
+    [ -f "$(ts_file "$1")" ] && cat "$(ts_file "$1")" || echo 0
+}
 
-  # Give STA time after boot
-  if [ "$el" -lt "$STA_TIMEOUT" ]; then
-    return
-  fi
+band_logic() {
+    local band="$1"
+    local sta_if="$2"
+    local uci_sta="$3"
+    local radio="$4"
+    local net="$5"
+    local ap_if="$6"
+    local uci_ap="$7"
+    local ssid="$8"
+    local STATE NOW TS elapsed
 
-  fv="$(failv "$b")"
-  fv=$((fv + CHECK_INTERVAL))
-  set_fail "$b" "$fv"
+    NOW=$(now)
+    STATE=$(get_state "$band")
+    TS=$(get_ts "$band")
 
-  if [ "$fv" -ge "$STA_TIMEOUT" ] && [ "$el" -ge "$MIN_STATE_SECS" ]; then
-    disable_sta "$sta" "$net"
+    # AP must always be up - check every iteration
+    ensure_ap "$ap_if" "$uci_ap" "$radio"
 
-    [ "$st" = "ap-only" ] || {
-      set_state "$b" "ap-only"
-      log "$b -> ap-only"
-    }
-  fi
+    # STA is connected
+    if is_link_up "$sta_if"; then
+        if [ "$STATE" != "connected" ]; then
+            log "$band STA connected on $sta_if"
+            set_state "$band" "connected"
+        fi
+        return
+    fi
+
+    # STA was connected but dropped - retry immediately without scan
+    if [ "$STATE" = "connected" ]; then
+        log "$band STA lost → retry immediately"
+        enable_sta "$uci_sta" "$radio" "$net"
+        set_state "$band" "trying"
+        return
+    fi
+
+    # First run - attempt immediately
+    if [ "$STATE" = "init" ]; then
+        log "$band init → enable STA"
+        enable_sta "$uci_sta" "$radio" "$net"
+        set_state "$band" "trying"
+        return
+    fi
+
+    # Waiting for association
+    if [ "$STATE" = "trying" ]; then
+        elapsed=$((NOW - TS))
+        if [ "$elapsed" -lt "$ASSOC_TIMEOUT" ]; then
+            return
+        fi
+        log "$band assoc timeout after ${elapsed}s → STA off, AP solo"
+        disable_sta "$uci_sta" "$radio" "$net"
+        set_state "$band" "off"
+        return
+    fi
+
+    # No uplink - periodic passive scan, NO wifi reload unless SSID found
+    if [ "$STATE" = "off" ]; then
+        elapsed=$((NOW - TS))
+        if [ "$elapsed" -lt "$PROBE_INTERVAL" ]; then
+            return
+        fi
+        log "$band probing for SSID '$ssid' via $ap_if (passive scan)"
+        if ssid_visible "$ap_if" "$ssid"; then
+            log "$band SSID '$ssid' found → enable STA"
+            enable_sta "$uci_sta" "$radio" "$net"
+            set_state "$band" "trying"
+        else
+            log "$band SSID '$ssid' not visible → stay off, AP untouched"
+            # Update timestamp to reset probe interval - no radio reload
+            set_state "$band" "off"
+        fi
+        return
+    fi
 }
 
 main() {
-  with_lock
-
-  # Always keep AP enabled
-  ensure_ap_enabled
-
-  # Detect uplinks
-  UPLINK_24=0
-  UPLINK_5=0
-
-  is_link_up "phy0-sta0" && UPLINK_24=1
-  is_link_up "phy1-sta0" && UPLINK_5=1
-
-  # If uplink on 2.4 → disable 5 GHz STA (critical fix)
-  if [ "$UPLINK_24" = "1" ] && [ "$UPLINK_5" = "0" ]; then
-    disable_sta "wsta5" "wan5"
-  fi
-
-  # If uplink on 5 GHz → disable 2.4 STA
-  if [ "$UPLINK_5" = "1" ] && [ "$UPLINK_24" = "0" ]; then
-    disable_sta "wsta24" "wan24"
-  fi
-
-  # If any uplink is active → do nothing else
-  if [ "$UPLINK_24" = "1" ] || [ "$UPLINK_5" = "1" ]; then
-    return
-  fi
-
-  # No uplink → fallback logic
-  band_tick "2g" "wsta24" "ap24" "phy0-sta0" "wan24"
-  band_tick "5g" "wsta5"  "ap5"  "phy1-sta0" "wan5"
+    with_lock
+    #          band  sta_if      uci_sta  radio    net     ap_if      uci_ap  ssid
+    band_logic "2g"  "phy0-sta0" "wsta24" "radio0" "wan24" "phy0-ap0" "ap24"  "TV24"
+    band_logic "5g"  "phy1-sta0" "wsta5"  "radio1" "wan5"  "phy1-ap0" "ap5"   "uplink"
 }
 
 while true; do
-  main
-  sleep "$CHECK_INTERVAL"
+    main
+    sleep "$CHECK_INTERVAL"
 done
